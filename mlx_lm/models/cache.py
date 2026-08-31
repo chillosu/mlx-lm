@@ -1680,6 +1680,17 @@ class LRUPromptCache:
     def nbytes(self):
         return self._n_bytes
 
+    def items(self):
+        """
+        Iterate over the ``(model, tokens, entry)`` of every cached sequence.
+
+        The LRU deques hold the key of every live entry, so they also work as
+        the iterator of the trie.
+        """
+        for cache_type in self._lru._ordering:
+            for model, tokens in list(self._lru._lrus[cache_type]):
+                yield model, tokens, self._trie.get(model, tokens)
+
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
         result = self._trie.search(model, tokens)
         if result.exact is not None:

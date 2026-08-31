@@ -153,3 +153,46 @@ list contains the following fields:
 
 - `id`: The Hugging Face repo id.
 - `created`: A time-stamp representing the model creation time.
+
+### Prompt Cache
+
+The server keeps the KV cache of the prompts that it has seen, so that a
+second prompt with the same start does not pay for the prefill again. That
+cache is in memory only and it goes away with the process. Use the
+`/admin/cache` endpoints to write it to disk and to read it back. A prompt of
+200K tokens can cost close to an hour of prefill, and a save makes that cost a
+one time cost.
+
+Save the cache under a name:
+
+```shell
+curl localhost:8080/admin/cache/save \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-corpus", "types": ["system"]}'
+```
+
+- `name`: (Required) 1 to 128 letters, digits, `.`, `_` or `-`.
+- `types`: (Optional) Only save these kinds of entry. One prompt leaves a
+  `system`, a `user` and an `assistant` entry in the cache, and only the
+  `system` entry is a start that other prompts share.
+- `min_tokens`: (Optional) Only save entries with at least this many tokens.
+
+Read it back after a restart:
+
+```shell
+curl localhost:8080/admin/cache/load \
+  -H "Content-Type: application/json" -d '{"name": "my-corpus"}'
+```
+
+Use `POST /admin/cache/clear` to empty the cache in memory, and
+`GET /admin/cache` to list the saved caches and the state of the live cache.
+
+The files go in `--prompt-cache-dir`, or in `$MLX_LM_PROMPT_CACHE_DIR`, or in
+`~/.cache/mlx-lm/prompt-cache`. Each rank of a distributed server writes its
+own file, `<name>-rank<N>.safetensors`, on its own machine. A load reads the
+file of every rank, so all the files must be there. A load also refuses a file
+from another model, another number of ranks or another cache layout.
+
+A save or a load can take minutes for a large cache, so give the client a long
+timeout. Both are refused with `409` while a generation is in flight, because
+the cache of a generation that runs is not yet in the prompt cache.
