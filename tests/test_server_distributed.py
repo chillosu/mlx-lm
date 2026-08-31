@@ -21,9 +21,14 @@ from unittest import mock
 
 import mlx.core as mx
 
-from mlx_lm import cache_store
+from mlx_lm import cache_store, server
 from mlx_lm.models.cache import ArraysCache, KVCache, LRUPromptCache, QuantizedKVCache
-from mlx_lm.server import APIHandler, PromptCacheRequest, ResponseGenerator
+from mlx_lm.server import (
+    _SLOW_SYNC_WARN_S,
+    APIHandler,
+    PromptCacheRequest,
+    ResponseGenerator,
+)
 
 LAYERS = "AAKAAK"
 LATENT, ROPE, HEADS, DIM = 128, 64, 2, 4
@@ -457,6 +462,38 @@ class TestPromptCacheGenerationLoop(unittest.TestCase):
         self.assertEqual(self.send("clear")["cleared"], 2)
         self.assertTrue(all(len(g.prompt_cache) == 0 for g in self.generators))
         self.assertTrue(all(t.is_alive() for t in self.threads))
+
+    def test_a_long_idle_poll_does_not_delay_a_request(self):
+        # A queue wakes on a put, so the loop picks a request up at once even
+        # when the idle poll is a full second.
+        latencies = []
+        for _ in range(3):
+            start = time.monotonic()
+            self.send("list")
+            latencies.append(time.monotonic() - start)
+            time.sleep(0.2)
+        self.assertLess(max(latencies), server._IDLE_POLL_S / 2)
+
+
+class TestSlowRankSync(unittest.TestCase):
+    def test_a_slow_share_request_is_reported(self):
+        generator = make_generator(LRUPromptCache(max_size=4), StubProvider())
+        share_request = generator._share_request
+        generator._share_request = lambda r: (
+            time.sleep(_SLOW_SYNC_WARN_S + 0.2),
+            share_request(r),
+        )[1]
+        with self.assertLogs(level=logging.WARNING) as logs:
+            generator._next_request(timeout=0.01)
+        message = "\n".join(logs.output)
+        self.assertIn("Slow rank sync", message)
+        self.assertIn("rank 0", message)
+        self.assertIn("had_request=False", message)
+
+    def test_a_normal_share_request_is_not_reported(self):
+        generator = make_generator(LRUPromptCache(max_size=4), StubProvider())
+        with self.assertNoLogs(level=logging.WARNING):
+            generator._next_request(timeout=0.01)
 
 
 class DeadGenerator:

@@ -4,6 +4,7 @@ import argparse
 import gc
 import json
 import logging
+import os
 import pickle
 import platform
 import socket
@@ -45,6 +46,25 @@ from .generate import (
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
+
+
+def _env_float(name, default):
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+# How long rank 0 waits on the request queue in one idle turn of the
+# generation loop. Every turn ends in a collective that joins all the ranks,
+# so a short wait makes the ranks meet many times per second for no work. A
+# queue wakes on a put, so a longer wait adds no delay to a request. It only
+# delays the stop of the server.
+_IDLE_POLL_S = _env_float("MLX_LM_IDLE_POLL_S", 1.0)
+
+# Report a collective that blocks for longer than this.
+_SLOW_SYNC_WARN_S = _env_float("MLX_LM_SLOW_SYNC_WARN_S", 1.0)
 
 
 def get_system_fingerprint():
@@ -484,7 +504,22 @@ class ResponseGenerator:
                     request = self.requests.get_nowait()
             except QueueEmpty:
                 pass
-        return self._share_request(request)
+
+        # All the ranks meet in _share_request. While one collective blocks,
+        # every rank is stopped and a request that arrives waits it out.
+        start = time.monotonic()
+        shared = self._share_request(request)
+        blocked = time.monotonic() - start
+        # A rank other than 0 waits in the collective for the whole queue poll
+        # of rank 0. That is the design, so raise its limit by the poll time.
+        limit = _SLOW_SYNC_WARN_S + (0.0 if self._rank == 0 else _IDLE_POLL_S)
+        if blocked >= limit:
+            logging.warning(
+                f"Slow rank sync: _share_request blocked {blocked:.1f}s on rank "
+                f"{self._rank} with had_request={request is not None}. All the "
+                f"ranks were stopped for that time."
+            )
+        return shared
 
     def _share_object(self, obj):
         if not self._is_distributed:
@@ -682,7 +717,7 @@ class ResponseGenerator:
                 timeout = (
                     None
                     if (batch_generator is not None and len(batch_results) > 0)
-                    else 0.1
+                    else _IDLE_POLL_S
                 )
                 request = get_next_request(timeout=timeout)
 
