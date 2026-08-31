@@ -32,6 +32,7 @@ from typing import (
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
+from . import cache_store
 from ._version import __version__
 from .generate import (
     BatchGenerator,
@@ -221,6 +222,22 @@ class GenerationContext:
 
     def stop(self):
         self._should_stop = True
+
+
+@dataclass
+class PromptCacheRequest:
+    """A request to save, load, clear or list the prompt cache.
+
+    It travels the same path as a completion so that every rank runs it at the
+    same point of the generation loop.
+    """
+
+    op: str  # save, load, clear or list
+    name: str = ""
+    # A single prefill leaves a system, a user and an assistant entry in the
+    # cache. The filters keep a save from writing all three.
+    types: Optional[List[str]] = None
+    min_tokens: int = 0
 
 
 @dataclass
@@ -673,6 +690,16 @@ class ResponseGenerator:
             if request is not None:
                 rqueue, request, args = request
 
+                # Only rank 0 runs the HTTP server. The shared request is the
+                # one place where all the ranks meet, so a prompt cache
+                # operation runs here. batch_results is the same on every rank
+                # so the in flight guard is the same on every rank.
+                if isinstance(request, PromptCacheRequest):
+                    self._serve_prompt_cache(
+                        rqueue, request, in_flight=len(batch_results)
+                    )
+                    continue
+
                 # Can it be added to the current batch?
                 if (
                     batch_generator is not None
@@ -880,6 +907,135 @@ class ResponseGenerator:
         del self.prompt_cache
         gc.collect()
 
+    def _prompt_cache_barrier(self, ok: bool) -> bool:
+        """Reduce the result of each rank to one decision for the whole group.
+
+        Every rank must leave an admin operation on the same branch. A rank
+        that returns something else puts the collectives of the generation
+        loop out of step and the server stops to answer.
+        """
+        if not self._is_distributed:
+            return bool(ok)
+        world = mx.distributed.init().size()
+        return mx.distributed.all_sum(1 if ok else 0).item() == world
+
+    def _serve_prompt_cache(self, rqueue, request, in_flight=0):
+        """Run one prompt cache operation on every rank in lockstep.
+
+        The number of barriers depends only on values that are the same on
+        every rank, never on the result of one rank.
+        """
+        rank = self._rank
+        world = mx.distributed.init().size()
+        root = getattr(self.cli_args, "prompt_cache_dir", None)
+        op = request.op
+        name = ""
+        path = None
+        result = None
+        error = None
+        changed = False
+        try:
+            if op in ("save", "load"):
+                name = cache_store.check_name(request.name)
+                if self.model_provider.model is None:
+                    raise RuntimeError("No model is loaded.")
+                if in_flight:
+                    raise RuntimeError(
+                        f"{in_flight} generation(s) are in flight. Wait for the "
+                        f"server to be idle before a prompt cache {op}."
+                    )
+                fingerprint = cache_store.make_fingerprint(
+                    self.model_provider.model,
+                    self.model_provider.model_key,
+                    rank,
+                    world,
+                )
+                path = cache_store.cache_path(name, rank, root)
+
+            if op == "save":
+                types = request.types
+                if types is not None:
+                    known = set(self.prompt_cache.stats_by_type())
+                    if not isinstance(types, list) or not set(types) <= known:
+                        raise ValueError(
+                            f"types must be a subset of {sorted(known)} but it "
+                            f"is {types!r}."
+                        )
+                logging.info(f"Saving the prompt cache '{name}' on rank {rank}.")
+                result = cache_store.save(
+                    self.prompt_cache,
+                    self.model_provider.model_key,
+                    fingerprint,
+                    path,
+                    types=types,
+                    min_tokens=int(request.min_tokens or 0),
+                )
+            elif op == "load":
+                # Check that every rank has a file before anything changes. A
+                # file set that is not complete must stop the load everywhere.
+                present = path.is_file()
+                if not self._prompt_cache_barrier(present):
+                    raise FileNotFoundError(
+                        f"The files of the prompt cache '{name}' are not "
+                        f"complete on the {world} rank(s). Rank {rank} has "
+                        f"present={present}."
+                    )
+                logging.info(f"Loading the prompt cache '{name}' on rank {rank}.")
+                changed = True
+                result = cache_store.load(
+                    self.prompt_cache,
+                    self.model_provider.model_key,
+                    fingerprint,
+                    path,
+                )
+            elif op == "clear":
+                n_sequences = len(self.prompt_cache)
+                self.prompt_cache.trim_to(n_sequences=0)
+                mx.clear_cache()
+                result = {"cleared": n_sequences}
+            elif op == "list":
+                result = cache_store.listing(self.prompt_cache, rank, root)
+            else:
+                raise ValueError(f"Unknown prompt cache operation {op!r}.")
+        except Exception as e:
+            error = e
+            logging.error(f"The prompt cache {op} failed on rank {rank}: {e}")
+
+        # A barrier that raises leaves the ranks out of step for good, so it
+        # must be loud and it must not kill the generation thread.
+        try:
+            agreed = self._prompt_cache_barrier(error is None)
+        except BaseException as e:
+            logging.critical(
+                f"The prompt cache {op} barrier failed on rank {rank}: {e!r}. "
+                "The ranks can be out of step. Restart the server."
+            )
+            rqueue.put(RuntimeError(f"The prompt cache {op} barrier failed: {e}"))
+            rqueue.put(None)
+            return
+
+        # If one rank failed then every rank goes back, so that all the ranks
+        # hold the same cache.
+        if not agreed:
+            if error is None:
+                if op == "save":
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                elif changed:
+                    self.prompt_cache.trim_to(n_sequences=0)
+                    mx.clear_cache()
+                error = RuntimeError(
+                    f"The prompt cache {op} failed on another rank. All the "
+                    f"ranks went back."
+                )
+            result = None
+
+        self._log_cache_stats()
+        rqueue.put(error if error is not None else result)
+        rqueue.put(None)
+
     def _serve_single(self, request, stream):
         rqueue, request, args = request
 
@@ -1072,6 +1228,10 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
         }
+
+        if self.path.startswith("/admin/cache"):
+            self.handle_prompt_cache_admin()
+            return
 
         if self.path not in request_factories:
             self._set_completion_headers(404)
@@ -1606,7 +1766,9 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path.startswith("/v1/models"):
+        if self.path.startswith("/admin/cache"):
+            self.handle_prompt_cache_admin()
+        elif self.path.startswith("/v1/models"):
             self.handle_models_request()
         elif self.path == "/health":
             self.handle_health_check()
@@ -1614,6 +1776,122 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
+
+    def _json_response(self, status_code, payload):
+        self._set_completion_headers(status_code)
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode())
+        self.wfile.flush()
+
+    def handle_prompt_cache_admin(self):
+        """
+        Handle the prompt cache endpoints.
+
+          POST /admin/cache/save   {"name": ..., "types": [...],
+                                    "min_tokens": ...}
+          POST /admin/cache/load   {"name": ...}
+          POST /admin/cache/clear  {}
+          GET  /admin/cache
+
+        The generation thread does the work on every rank. This handler only
+        puts the request in the queue and waits for the answer.
+        """
+        tail = self.path.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+        if self.command == "GET":
+            op = "list" if tail in ("cache", "list") else tail
+        else:
+            op = tail
+        if op not in ("save", "load", "clear", "list"):
+            self._set_completion_headers(404)
+            self.end_headers()
+            self.wfile.write(b"Not Found")
+            return
+
+        body = {}
+        if self.command == "POST":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length > 0:
+                try:
+                    body = json.loads(self.rfile.read(length).decode())
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    self._json_response(400, {"error": f"Invalid JSON body: {e}"})
+                    return
+        if not isinstance(body, dict):
+            body = {}
+
+        name = body.get("name", "")
+        if not isinstance(name, str):
+            self._json_response(400, {"error": "name must be a string"})
+            return
+        types = body.get("types")
+        if types is not None and not (
+            isinstance(types, list) and all(isinstance(t, str) for t in types)
+        ):
+            self._json_response(400, {"error": "types must be a list of strings"})
+            return
+        try:
+            min_tokens = int(body.get("min_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            self._json_response(400, {"error": "min_tokens must be an integer"})
+            return
+
+        # A listing changes nothing and reads no other rank, so rank 0 answers
+        # it. It must not wait for the generation loop.
+        generator = self.response_generator
+        if op == "list":
+            root = getattr(generator.cli_args, "prompt_cache_dir", None)
+            payload = cache_store.listing(generator.prompt_cache, generator._rank, root)
+            self._json_response(200, {"op": op, "name": name, "result": payload})
+            return
+
+        rqueue = Queue()
+        generator.requests.put(
+            (
+                rqueue,
+                PromptCacheRequest(
+                    op=op, name=name, types=types, min_tokens=min_tokens
+                ),
+                None,
+            )
+        )
+        # A save or a load of a large cache takes a long time. The other
+        # operations only wait for the generation loop to come around.
+        timeout = 3600 if op in ("save", "load") else 120
+        try:
+            outcome = rqueue.get(timeout=timeout)
+            rqueue.get(timeout=60)
+        except QueueEmpty:
+            logging.error(
+                f"The prompt cache {op} gave no answer in {timeout}s. The "
+                "generation loop does not complete it."
+            )
+            self._json_response(
+                504,
+                {
+                    "error": f"No answer from the generation loop in {timeout}s.",
+                    "type": "Timeout",
+                },
+            )
+            return
+
+        if isinstance(outcome, Exception):
+            if isinstance(outcome, FileNotFoundError):
+                status = 404
+            elif isinstance(outcome, ValueError):
+                status = 400
+            elif isinstance(outcome, OSError):
+                status = 507
+            else:
+                status = 409
+            self._json_response(
+                status, {"error": str(outcome), "type": type(outcome).__name__}
+            )
+            return
+
+        self._json_response(200, {"op": op, "name": name, "result": outcome})
 
     def handle_health_check(self):
         """
@@ -1867,6 +2145,16 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--prompt-cache-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory for the prompt caches that /admin/cache saves and "
+            "loads (default: $MLX_LM_PROMPT_CACHE_DIR or "
+            f"{cache_store.DEFAULT_DIR})"
+        ),
     )
     parser.add_argument(
         "--pipeline",
