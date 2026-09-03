@@ -601,6 +601,8 @@ def _infer_tool_parser(chat_template):
         return None
     elif "<minimax:tool_call>" in chat_template:
         return "minimax_m2"
+    elif "｜DSML｜" in chat_template:
+        return "deepseek_v4"
     elif "<|tool_call>" in chat_template and "<tool_call|>" in chat_template:
         return "gemma4"
     elif "<start_function_call>" in chat_template:
