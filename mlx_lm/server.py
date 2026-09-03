@@ -4,7 +4,9 @@ import argparse
 import json
 import logging
 import pickle
+import os
 import platform
+import shutil
 import socket
 import time
 import uuid
@@ -40,7 +42,335 @@ from .generate import (
     make_text_state_machine,
     stream_generate,
 )
+from mlx.utils import tree_flatten, tree_unflatten
+
+from .models import cache as _cache_module
 from .models.cache import LRUPromptCache, make_prompt_cache
+
+
+# ---- PROMPT-CACHE-DISK-PERSIST -------------------------------------------
+# Persist the LRUPromptCache to local disk, one shard file per rank. See
+# patch-server-cachepersist.py for the design rationale.
+
+CACHE_STORE_VERSION = "1"
+
+
+# ---- IDLE-SYNC-V3 --------------------------------------------------------
+# How long rank 0 blocks on the request queue per idle iteration. Upstream
+# hard-codes 0.1s. Queue.get wakes instantly on put, so raising this costs no
+# pickup latency -- it only reduces how many do-nothing heartbeat collectives
+# the fleet issues, and therefore how often a request lands mid-collective.
+def _env_float(name, default):
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+_IDLE_POLL_S = _env_float("MLX_LM_IDLE_POLL_S", 1.0)
+_SLOW_SYNC_WARN_S = _env_float("MLX_LM_SLOW_SYNC_WARN_S", 1.0)
+_CACHE_NAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+@dataclass
+class CachePersistRequest:
+    """A pseudo-request routed through the normal (rank-synchronous) path."""
+
+    op: str  # save | load | clear | list
+    name: str = ""
+    # Save filters. A single prefill leaves a system, a user and an assistant
+    # entry in the trie, each carrying the full per-entry KDA state; at 949K
+    # tokens saving all three costs ~3x the disk of saving the one you want.
+    types: Optional[List[str]] = None
+    min_tokens: int = 0
+    # CACHE-LOOKUP-V4: rank-0 monotonic stamp, so the dequeue log can separate
+    # time spent queued behind the idle-sync stall from time spent working.
+    enqueued_at: float = 0.0
+
+
+def _cache_store_dir() -> Path:
+    return Path(
+        os.environ.get("MLX_LM_CACHE_STORE", str(Path.home() / "k3" / "cache-store"))
+    )
+
+
+def _cache_store_path(name: str, rank: int) -> Path:
+    return _cache_store_dir() / f"{name}-rank{rank}.safetensors"
+
+
+def _safe_cache_name(name: str) -> str:
+    if (
+        not name
+        or len(name) > 128
+        or name.startswith(".")
+        or not set(name) <= _CACHE_NAME_CHARS
+    ):
+        raise ValueError(
+            "invalid cache name (allowed: letters, digits, '.', '_', '-'; "
+            f"1-128 chars, no leading dot): {name!r}"
+        )
+    return name
+
+
+def _cache_fingerprint(model_provider, rank: int, world: int) -> dict:
+    """Identity of the configuration that produced a cache.
+
+    A cache saved under different kv_bits / kv_group_size / model / world size
+    is not merely stale, it is structurally wrong -- loading it would either
+    crash in attention or silently produce garbage. Every field here is
+    compared exactly on load.
+    """
+    args = model_provider.cli_args
+    kinds = "".join(
+        "A" if type(c).__name__ == "ArraysCache" else "K"
+        for c in make_prompt_cache(model_provider.model)
+    )
+    return {
+        "version": CACHE_STORE_VERSION,
+        "model_key": repr(model_provider.model_key),
+        "rank": str(rank),
+        "world": str(world),
+        "kv_bits": str(args.kv_bits),
+        "kv_group_size": str(args.kv_group_size),
+        "quantized_kv_start": str(args.quantized_kv_start),
+        "layer_kinds": kinds,
+    }
+
+
+_CACHE_FINGERPRINT_FIELDS = (
+    "version",
+    "model_key",
+    "rank",
+    "world",
+    "kv_bits",
+    "kv_group_size",
+    "quantized_kv_start",
+    "layer_kinds",
+)
+
+
+def _cache_store_listing(prompt_cache, rank):
+    """CACHE-ADMIN-V2: read-only snapshot of one rank's store and live trie.
+
+    Pure reads of local state -- no collective, so this is safe to answer
+    straight from the HTTP thread on rank 0.
+    """
+    store = _cache_store_dir()
+    suffix = f"-rank{rank}.safetensors"
+    names = []
+    if store.is_dir():
+        names = sorted(
+            p.name[: -len(suffix)] for p in store.glob(f"*{suffix}") if p.is_file()
+        )
+    return {
+        "store": str(store),
+        "rank": rank,
+        "saved": names,
+        "in_memory": {
+            "sequences": len(prompt_cache),
+            "bytes": prompt_cache.nbytes,
+            "by_type": prompt_cache.stats_by_type(),
+        },
+    }
+
+
+_CACHE_LOOKUP_DEBUG = os.environ.get("MLX_LM_CACHE_LOOKUP_DEBUG", "1") != "0"
+
+
+def _log_cache_lookup(prompt_cache, model_key, prompt, matched):
+    """CACHE-LOOKUP-V4: explain why a prompt-cache lookup did or did not hit.
+
+    K3's cache is not trimmable (ArraysCache.is_trimmable() is False), so
+    fetch_nearest_cache serves only an exact match or an entry whose ENTIRE
+    token path is a prefix of the incoming prompt. An entry agreeing on 12,600
+    of its 12,644 tokens is worth nothing. Logging the per-entry common-prefix
+    length is what separates "not restored" from "restored but not a prefix"
+    from "filed under a different model_key".
+    """
+    if not _CACHE_LOOKUP_DEBUG:
+        return
+    try:
+        n_entries = len(prompt_cache)
+        if matched:
+            logging.info(
+                f"cache lookup: HIT prompt={len(prompt)} cached={matched} "
+                f"entries={n_entries}"
+            )
+            return
+        in_trie = model_key in prompt_cache._trie._trie
+        logging.info(
+            f"cache lookup: MISS prompt={len(prompt)} entries={n_entries} "
+            f"model_key_in_trie={in_trie} model_key={model_key!r}"
+        )
+        for cache_type in prompt_cache._lru._ordering:
+            for model, tokens in list(prompt_cache._lru._lrus[cache_type]):
+                if model != model_key:
+                    logging.info(
+                        f"  entry type={cache_type} len={len(tokens)} "
+                        f"SKIPPED (different model_key={model!r})"
+                    )
+                    continue
+                common = 0
+                for a, b in zip(tokens, prompt):
+                    if a != b:
+                        break
+                    common += 1
+                full = common == len(tokens)
+                note = " <- USABLE prefix" if full else " (diverges; unusable)"
+                logging.info(
+                    f"  entry type={cache_type} len={len(tokens)} "
+                    f"common_prefix={common} is_full_prefix={full}{note}"
+                )
+    except Exception as e:
+        logging.warning(f"cache lookup diagnostic failed: {e!r}")
+
+
+def _iter_cache_entries(prompt_cache):
+    """Enumerate (model_key, tokens, entry, cache_type) in the LRU trie.
+
+    The LRU deques hold exactly the set of live (model, tokens) keys, so they
+    double as the trie's iterator.
+    """
+    for cache_type in prompt_cache._lru._ordering:
+        for model, tokens in list(prompt_cache._lru._lrus[cache_type]):
+            yield model, list(tokens), prompt_cache._trie.get(model, tokens), cache_type
+
+
+def _save_prompt_cache_store(
+    prompt_cache, model_provider, name, rank, world, types=None, min_tokens=0
+):
+    entries = []
+    total = 0
+    skipped = 0
+    for model, tokens, entry, cache_type in _iter_cache_entries(prompt_cache):
+        if model != model_provider.model_key or not tokens:
+            skipped += 1
+            continue
+        if types is not None and cache_type not in types:
+            skipped += 1
+            continue
+        if len(tokens) < min_tokens:
+            skipped += 1
+            continue
+        if any(c.empty() for c in entry.prompt_cache):
+            skipped += 1
+            continue
+        entries.append((entry.prompt_cache, tokens, cache_type))
+        total += entry.nbytes
+    if not entries:
+        raise ValueError(
+            f"prompt cache holds no saveable entries (skipped {skipped}; "
+            f"types={types}, min_tokens={min_tokens})"
+        )
+
+    path = _cache_store_path(name, rank)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    need = int(total * 1.10) + (1 << 26)
+    free = shutil.disk_usage(path.parent).free
+    if free < need:
+        raise OSError(
+            f"insufficient disk in {path.parent}: need ~{need / 1e9:.1f} GB, "
+            f"free {free / 1e9:.1f} GB"
+        )
+
+    payload = {
+        "c": [[c.state for c in caches] for caches, _, _ in entries],
+        "t": [mx.array(tokens, dtype=mx.int32) for _, tokens, _ in entries],
+    }
+    metadata = {
+        "m": [[c.meta_state for c in caches] for caches, _, _ in entries],
+        "k": [[type(c).__name__ for c in caches] for caches, _, _ in entries],
+        "y": [cache_type for _, _, cache_type in entries],
+        "n": [str(len(tokens)) for _, tokens, _ in entries],
+        "f": _cache_fingerprint(model_provider, rank, world),
+    }
+    arrays = dict(tree_flatten(payload))
+    # mx.save_safetensors force-appends '.safetensors', so the staging file has
+    # to keep that extension; the rename is still same-directory and atomic.
+    tmp = path.parent / f"{path.stem}.tmp{os.getpid()}.safetensors"
+    try:
+        mx.save_safetensors(str(tmp), arrays, dict(tree_flatten(metadata)))
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        del arrays, payload
+        mx.clear_cache()
+
+    return {
+        "entries": len(entries),
+        "skipped": skipped,
+        "bytes": path.stat().st_size,
+        "tokens": [len(tokens) for _, tokens, _ in entries],
+        "types": [cache_type for _, _, cache_type in entries],
+        "path": str(path),
+    }
+
+
+def _load_prompt_cache_store(prompt_cache, model_provider, name, rank, world):
+    path = _cache_store_path(name, rank)
+    arrays, raw_metadata = mx.load(str(path), return_metadata=True)
+    payload = tree_unflatten(list(arrays.items()))
+    metadata = tree_unflatten(list(raw_metadata.items()))
+    del arrays, raw_metadata
+
+    want = _cache_fingerprint(model_provider, rank, world)
+    got = metadata.get("f", {})
+    if not isinstance(got, dict):
+        raise ValueError(f"{path.name}: malformed fingerprint")
+    for field in _CACHE_FINGERPRINT_FIELDS:
+        if got.get(field) != want[field]:
+            raise ValueError(
+                f"refusing to load {path.name}: {field} mismatch "
+                f"(file={got.get(field)!r}, server={want[field]!r})"
+            )
+
+    # Reconstruct and validate EVERY entry before touching the live cache, so a
+    # bad file cannot leave the trie half-populated.
+    restored = []
+    for i, (states, token_array) in enumerate(zip(payload["c"], payload["t"])):
+        tokens = token_array.tolist()
+        if len(tokens) != int(metadata["n"][i]):
+            raise ValueError(
+                f"{path.name}: entry {i} token count {len(tokens)} != "
+                f"recorded {metadata['n'][i]}"
+            )
+        classes = metadata["k"][i]
+        metas = metadata["m"][i]
+        if not (len(classes) == len(metas) == len(states)):
+            raise ValueError(f"{path.name}: entry {i} layer count mismatch")
+        caches = []
+        for class_name, state, meta_state in zip(classes, states, metas):
+            cls = getattr(_cache_module, class_name, None)
+            if cls is None or not isinstance(cls, type):
+                raise ValueError(f"{path.name}: unknown cache class {class_name!r}")
+            caches.append(cls.from_state(state, meta_state))
+        # The KV layers carry an offset; it must line up with the token path or
+        # the trie key lies about how much of a prompt this cache covers.
+        for c in caches:
+            offset = getattr(c, "offset", None)
+            if offset is not None and abs(int(offset) - len(tokens)) > 8:
+                raise ValueError(
+                    f"{path.name}: entry {i} cache offset {offset} does not "
+                    f"match its {len(tokens)}-token key"
+                )
+        restored.append((tokens, caches, metadata["y"][i]))
+
+    for tokens, caches, cache_type in restored:
+        prompt_cache.insert_cache(
+            model_provider.model_key, tokens, caches, cache_type=cache_type
+        )
+    mx.clear_cache()
+    return {
+        "entries": len(restored),
+        "tokens": [len(t) for t, _, _ in restored],
+        "types": [y for _, _, y in restored],
+        "path": str(path),
+    }
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -458,7 +788,27 @@ class ResponseGenerator:
                     request = self.requests.get_nowait()
             except QueueEmpty:
                 pass
-        return self._share_request(request)
+        # IDLE-SYNC-V3: _share_request is where all four ranks meet. On an idle
+        # fleet it is a do-nothing heartbeat collective; a single one of these
+        # stalling is what produced the 201s admin-op dequeue latency, and it
+        # freezes every request type for as long as it lasts.
+        _t0 = time.monotonic()
+        shared = self._share_request(request)
+        _dt = time.monotonic() - _t0
+        # Ranks 1-3 legitimately sit in the collective for the whole of rank 0's
+        # queue poll -- that is the design, not a stall -- so their threshold is
+        # raised by the poll interval. Rank 0 should never wait: its peers are
+        # already there when it arrives.
+        _limit = _SLOW_SYNC_WARN_S + (0.0 if self._rank == 0 else _IDLE_POLL_S)
+        if _dt >= _limit:
+            logging.warning(
+                f"slow rank sync: _share_request blocked {_dt:.1f}s "
+                f"(rank={self._rank}, had_request={request is not None}, "
+                f"idle_poll={_IDLE_POLL_S}s, limit={_limit}s). All ranks were "
+                f"stalled this long; any request arriving in that window "
+                f"waited it out."
+            )
+        return shared
 
     def _share_object(self, obj):
         if not self._is_distributed:
@@ -656,13 +1006,39 @@ class ResponseGenerator:
                 timeout = (
                     None
                     if (batch_generator is not None and len(batch_results) > 0)
-                    else 0.1
+                    else _IDLE_POLL_S
                 )
                 request = get_next_request(timeout=timeout)
 
             # We got a request
             if request is not None:
                 rqueue, request, args = request
+
+                # PROMPT-CACHE-DISK-PERSIST: handled here, inside the
+                # generation thread, because only rank 0 runs the HTTP server
+                # -- the shared-request path is the one place all ranks meet
+                # in lockstep. `batch_results` is identical on every rank, so
+                # the in-flight guard is symmetric.
+                if isinstance(request, CachePersistRequest):
+                    _queued = (
+                        time.monotonic() - request.enqueued_at
+                        if self._rank == 0 and request.enqueued_at
+                        else None
+                    )
+                    logging.info(
+                        f"cache-store: dequeued op='{request.op}' "
+                        f"name={request.name!r} rank={self._rank} "
+                        f"in_flight={len(batch_results)} "
+                        + (
+                            f"queued_for={_queued:.1f}s"
+                            if _queued is not None
+                            else "queued_for=n/a"
+                        )
+                    )
+                    self._serve_cache_admin(
+                        rqueue, request, in_flight=len(batch_results)
+                    )
+                    continue
 
                 # Can it be added to the current batch?
                 if (
@@ -689,6 +1065,12 @@ class ResponseGenerator:
                         current_model_key, prompt
                     )
                     prompt_cache_count = len(prompt) - len(rest)
+                    _log_cache_lookup(
+                        self.prompt_cache,
+                        current_model_key,
+                        prompt,
+                        prompt_cache_count,
+                    )
                     N = prompt_cache_count
                     while N > 0:
                         if N >= len(segments[0]):
@@ -865,6 +1247,142 @@ class ResponseGenerator:
                         # generation
                         batch_results.pop(uid, None)
 
+    def _cache_admin_barrier(self, ok: bool) -> bool:
+        """Reduce a per-rank success flag to one fleet-wide decision.
+
+        PROMPT-CACHE-DISK-PERSIST: every rank must leave an admin op on the
+        same branch. If one rank raised and the others did not, an
+        asymmetric return would desynchronise the all_sum collectives that
+        drive the generation loop and wedge the server.
+        """
+        if not self._is_distributed:
+            return bool(ok)
+        # CACHE-ADMIN-V2: same call form _share_object uses (plain Python int,
+        # .item() on the result) -- that form is proven on this fleet. The
+        # timing log on both sides tells a slow collective from a hung one.
+        world = mx.distributed.init().size()
+        t0 = time.monotonic()
+        logging.info(
+            f"cache-store: barrier enter rank={self._rank} ok={bool(ok)}"
+        )
+        total = mx.distributed.all_sum(1 if ok else 0).item()
+        logging.info(
+            f"cache-store: barrier leave rank={self._rank} total={total}/{world} "
+            f"dt={time.monotonic() - t0:.3f}s"
+        )
+        return total == world
+
+    def _serve_cache_admin(self, rqueue, request, in_flight=0):
+        """Handle a CachePersistRequest. Runs on EVERY rank, in lockstep.
+
+        Collective discipline: the number of barriers executed depends only on
+        values that are identical across ranks (the shared request, and
+        len(batch_results)), never on a per-rank outcome.
+        """
+        world = mx.distributed.init().size()
+        rank = self._rank
+        op = request.op
+        result = None
+        error = None
+        mutated = False
+        name = ""
+        try:
+            if op in ("save", "load"):
+                name = _safe_cache_name(request.name)
+                if self.model_provider.model is None:
+                    raise RuntimeError("no model is loaded")
+                if in_flight:
+                    raise RuntimeError(
+                        f"{in_flight} generation(s) in flight; quiesce the "
+                        f"server before a cache {op}"
+                    )
+
+            if op == "save":
+                types = request.types
+                if types is not None:
+                    known = set(self.prompt_cache._lru._ordering)
+                    if not isinstance(types, list) or not set(types) <= known:
+                        raise ValueError(
+                            f"types must be a subset of {sorted(known)}, got {types!r}"
+                        )
+                logging.info(f"cache-store: saving '{name}' (rank {rank})")
+                result = _save_prompt_cache_store(
+                    self.prompt_cache,
+                    self.model_provider,
+                    name,
+                    rank,
+                    world,
+                    types=types,
+                    min_tokens=int(request.min_tokens or 0),
+                )
+            elif op == "load":
+                # Presence barrier BEFORE any mutation: a partial shard set
+                # must abort on all ranks, not leave 3 of 4 populated.
+                present = _cache_store_path(name, rank).exists()
+                if not self._cache_admin_barrier(present):
+                    raise FileNotFoundError(
+                        f"cache '{name}' shard set is incomplete across the "
+                        f"{world} rank(s) (rank {rank} present={present}); "
+                        f"refusing a partial load"
+                    )
+                logging.info(f"cache-store: loading '{name}' (rank {rank})")
+                mutated = True
+                result = _load_prompt_cache_store(
+                    self.prompt_cache, self.model_provider, name, rank, world
+                )
+            elif op == "clear":
+                n = len(self.prompt_cache)
+                self.prompt_cache.trim_to(n_sequences=0)
+                mx.clear_cache()
+                result = {"cleared": n}
+            elif op == "list":
+                result = _cache_store_listing(self.prompt_cache, rank)
+            else:
+                raise ValueError(f"unknown cache admin op: {op!r}")
+        except Exception as e:
+            error = e
+            logging.error(f"cache-store: {op} failed on rank {rank}: {e}")
+
+        # Fleet-wide agreement. If ANY rank failed, every rank rolls back so
+        # the ranks stay structurally identical.
+        #
+        # CACHE-ADMIN-V2: this call used to sit outside the try/except above, so
+        # a throwing collective propagated out of _generate and killed the
+        # generation thread -- every later request would then hang forever with
+        # no error anywhere. A desynchronised fleet is unrecoverable either way,
+        # but it must be loud rather than silent.
+        try:
+            agreed = self._cache_admin_barrier(error is None)
+        except BaseException as e:
+            logging.critical(
+                f"cache-store: barrier FAILED on rank {rank} during '{op}': {e!r}; "
+                f"ranks may now be desynchronised -- restart the fleet"
+            )
+            rqueue.put(RuntimeError(f"cache-store {op}: barrier failed: {e}"))
+            rqueue.put(None)
+            return
+
+        if not agreed:
+            if error is None:
+                if op == "save":
+                    try:
+                        _cache_store_path(name, rank).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                elif mutated:
+                    # Blunt but symmetric: drop the whole in-memory cache so
+                    # all ranks agree on an empty trie.
+                    self.prompt_cache.trim_to(n_sequences=0)
+                    mx.clear_cache()
+                error = RuntimeError(
+                    f"cache-store {op}: a peer rank failed; rolled back on all ranks"
+                )
+            result = None
+
+        self._log_cache_stats()
+        rqueue.put(error if error is not None else result)
+        rqueue.put(None)
+
     def _serve_single(self, request):
         rqueue, request, args = request
 
@@ -911,6 +1429,12 @@ class ResponseGenerator:
                 self.model_provider.model_key, prompt
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
+            _log_cache_lookup(
+                self.prompt_cache,
+                self.model_provider.model_key,
+                prompt,
+                ctx.prompt_cache_count,
+            )
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
@@ -931,6 +1455,9 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
             ):
                 finish_reason = gen.finish_reason
 
@@ -1056,6 +1583,10 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
         }
+
+        if self.path.startswith("/admin/cache"):
+            self.handle_cache_admin()
+            return
 
         if self.path not in request_factories:
             self._set_completion_headers(404)
@@ -1361,6 +1892,9 @@ class APIHandler(BaseHTTPRequestHandler):
         # the progress)
         def keepalive_callback(processed, total):
             logging.info(f"Prompt processing progress: {processed}/{total}")
+            # bound allocator pool during long prefills (stale size-class
+            # buffers otherwise accumulate ~linearly with prompt depth)
+            mx.clear_cache()
             if self.stream:
                 msg = f": keepalive {processed}/{total}\n\n".encode()
                 self.wfile.write(msg)
@@ -1590,7 +2124,9 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path.startswith("/v1/models"):
+        if self.path.startswith("/admin/cache"):
+            self.handle_cache_admin()
+        elif self.path.startswith("/v1/models"):
             self.handle_models_request()
         elif self.path == "/health":
             self.handle_health_check()
@@ -1598,6 +2134,160 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
+
+    def handle_cache_admin(self):
+        """PROMPT-CACHE-DISK-PERSIST admin endpoints.
+
+            POST /admin/cache/save   {"name": "...",
+                                      "types": ["system"],   # optional filter
+                                      "min_tokens": 1000}    # optional filter
+            POST /admin/cache/load   {"name": "..."}
+            POST /admin/cache/clear  {}
+            GET  /admin/cache
+
+        The work is done by the generation thread on every rank; this handler
+        only enqueues and waits. Save/load of a large cache can take tens of
+        seconds -- use a generous client timeout.
+        """
+        tail = self.path.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+        if self.command == "GET":
+            # /admin/cache and /admin/cache/list are the listing; anything else
+            # falls through to the whitelist below and 404s.
+            op = "list" if tail in ("cache", "list") else tail
+        else:
+            op = tail
+        if op not in ("save", "load", "clear", "list"):
+            self._set_completion_headers(404)
+            self.end_headers()
+            self.wfile.write(b"Not Found")
+            return
+
+        body = {}
+        if self.command == "POST":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length > 0:
+                try:
+                    body = json.loads(self.rfile.read(length).decode())
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    self._set_completion_headers(400)
+                    self.end_headers()
+                    self.wfile.write(
+                        json.dumps({"error": f"invalid JSON body: {e}"}).encode()
+                    )
+                    return
+        if not isinstance(body, dict):
+            body = {}
+        name = body.get("name", "")
+        if not isinstance(name, str):
+            name = ""
+        types = body.get("types")
+        if types is not None and not (
+            isinstance(types, list) and all(isinstance(t, str) for t in types)
+        ):
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "types must be a list of strings"}).encode()
+            )
+            return
+        try:
+            min_tokens = int(body.get("min_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "min_tokens must be an integer"}).encode()
+            )
+            return
+
+        # CACHE-ADMIN-V2: read-only ops are answered from rank 0's own state.
+        # They mutate nothing and read no other rank, so routing them through
+        # the lockstep generation loop bought nothing while putting a collective
+        # on a path that must never be able to hang.
+        if op == "list":
+            rg = self.response_generator
+            payload = _cache_store_listing(rg.prompt_cache, rg._rank)
+            self._set_completion_headers(200)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"op": op, "name": name, "result": payload}).encode()
+            )
+            self.wfile.flush()
+            return
+
+        logging.info(f"cache-store: enqueued op='{op}' name={name!r}")
+        rqueue = Queue()
+        self.response_generator.requests.put(
+            (
+                rqueue,
+                CachePersistRequest(
+                    op=op,
+                    name=name,
+                    types=types,
+                    min_tokens=min_tokens,
+                    enqueued_at=time.monotonic(),
+                ),
+                None,
+            )
+        )
+        wait_s = 3600 if op in ("save", "load") else 120
+        t0 = time.monotonic()
+        try:
+            outcome = rqueue.get(timeout=wait_s)
+            rqueue.get(timeout=60)  # trailing None sentinel
+        except QueueEmpty:
+            logging.error(
+                f"cache-store: op='{op}' name={name!r} produced no result in "
+                f"{wait_s}s -- the generation loop is not completing it. Check "
+                f"every rank's log for 'cache-store: barrier enter/leave'."
+            )
+            self._set_completion_headers(504)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    {
+                        "error": (
+                            f"no response from the generation loop within {wait_s}s; "
+                            f"grep the rank logs for 'cache-store:'"
+                        ),
+                        "type": "Timeout",
+                    }
+                ).encode()
+            )
+            self.wfile.flush()
+            return
+        logging.info(
+            f"cache-store: op='{op}' completed in {time.monotonic() - t0:.3f}s"
+        )
+
+        if isinstance(outcome, Exception):
+            if isinstance(outcome, FileNotFoundError):
+                status = 404
+            elif isinstance(outcome, ValueError):
+                status = 400
+            elif isinstance(outcome, OSError):
+                status = 507
+            else:
+                status = 409
+            self._set_completion_headers(status)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    {"error": str(outcome), "type": type(outcome).__name__}
+                ).encode()
+            )
+            self.wfile.flush()
+            return
+
+        self._set_completion_headers(200)
+        self.end_headers()
+        self.wfile.write(
+            json.dumps({"op": op, "name": name, "result": outcome}).encode()
+        )
+        self.wfile.flush()
 
     def handle_health_check(self):
         """
@@ -1836,6 +2526,24 @@ def main():
         type=int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Bits for KV cache quantization (default: none/fp16)",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=0,
+        help="Token offset to begin quantizing KV (default: 0)",
     )
     parser.add_argument(
         "--prompt-cache-size",

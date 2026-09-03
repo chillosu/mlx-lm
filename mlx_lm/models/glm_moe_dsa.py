@@ -43,6 +43,8 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Dict = None
     rope_theta: Optional[float] = None
     indexer_rope_interleave: bool = True
+    # Per-layer DSA indexer schedule ("full" -> own indexer, else none).
+    indexer_types: Optional[Any] = None
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters
