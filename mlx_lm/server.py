@@ -843,7 +843,7 @@ class ResponseGenerator:
                             Response(
                                 text,
                                 r.token,
-                                r.logprobs[r.token].item(),
+                                r.logprob,
                                 r.finish_reason,
                                 _format_top_logprobs(
                                     r.logprobs,

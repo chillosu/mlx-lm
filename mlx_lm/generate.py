@@ -1280,6 +1280,12 @@ class GenerationBatch:
         finish_reason: Optional[str]
         prompt_cache: Optional[List[Any]]
         all_tokens: Optional[List[int]]
+        # Log-probability of ``token``, gathered inside the step graph. Use
+        # this instead of ``logprobs[token].item()``: that per-token gather
+        # is queued on the generation stream *behind* the already-dispatched
+        # next step and blocks until it drains, serializing CPU graph
+        # encoding with GPU execution (measured -14% decode at B=1).
+        logprob: Optional[float] = None
 
     def __init__(
         self,
@@ -1314,6 +1320,8 @@ class GenerationBatch:
         self._current_logprobs = []
         self._next_tokens = inputs
         self._next_logprobs = []
+        self._current_token_logprobs = None
+        self._next_token_logprobs = mx.zeros(inputs.shape)
         self._token_context = [TokenBuffer(t) for t in tokens]
         self._num_tokens = [0] * len(self.uids)
         self._matcher_states = [m.make_state() for m in stop_matchers]
@@ -1344,22 +1352,28 @@ class GenerationBatch:
         if self._next_tokens is None:
             self._next_tokens = batch._next_tokens
             self._next_logprobs = batch._next_logprobs
+            self._next_token_logprobs = batch._next_token_logprobs
         elif batch._next_tokens is not None:
             self._next_tokens = mx.concatenate([self._next_tokens, batch._next_tokens])
             self._next_logprobs.extend(batch._next_logprobs)
+            self._next_token_logprobs = mx.concatenate(
+                [self._next_token_logprobs, batch._next_token_logprobs]
+            )
         self._token_context.extend(batch._token_context)
         self._num_tokens.extend(batch._num_tokens)
         self._matcher_states.extend(batch._matcher_states)
 
-    def _step(self) -> Tuple[List[int], List[mx.array]]:
+    def _step(self) -> Tuple[List[int], List[mx.array], List[float]]:
         """
         Perform a single generation step.
 
         Returns:
-            Tuple of token list and logprobs list.
+            Tuple of token list, logprobs list and the log-probability of
+            each token.
         """
         self._current_tokens = self._next_tokens
         self._current_logprobs = self._next_logprobs
+        self._current_token_logprobs = self._next_token_logprobs
         inputs = self._current_tokens
 
         # Forward pass
@@ -1401,16 +1415,27 @@ class GenerationBatch:
         # asynchronously
         self._next_tokens = sampled
         self._next_logprobs = list(logprobs)
-        mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
+        # Gather the sampled token's log-prob here so it is evaluated together
+        # with the token (see Response.logprob).
+        self._next_token_logprobs = mx.take_along_axis(
+            logprobs, sampled[:, None], axis=-1
+        ).squeeze(-1)
+        mx.async_eval(
+            self._next_tokens,
+            self._next_logprobs,
+            self._next_token_logprobs,
+            token_context,
+        )
 
         # Eval the current tokens and current logprobs. After that also add
         # them to self.tokens so that it always represents the tokens contained
         # in the KV Cache.
-        mx.eval(inputs, self._current_logprobs)
+        mx.eval(inputs, self._current_logprobs, self._current_token_logprobs)
         inputs = inputs.tolist()
+        token_logprobs = self._current_token_logprobs.tolist()
         for sti, ti in zip(self.tokens, inputs):
             sti.append(ti)
-        return inputs, self._current_logprobs
+        return inputs, self._current_logprobs, token_logprobs
 
     def extract_cache(self, idx: int) -> List[Any]:
         return [c.extract(idx) for c in self.prompt_cache]
@@ -1431,6 +1456,9 @@ class GenerationBatch:
 
         self._next_tokens = self._next_tokens[keep] if keep else None
         self._next_logprobs = [self._next_logprobs[idx] for idx in keep]
+        self._next_token_logprobs = (
+            self._next_token_logprobs[keep] if keep else None
+        )
         self._token_context = [self._token_context[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
         self._matcher_states = [self._matcher_states[idx] for idx in keep]
@@ -1445,7 +1473,7 @@ class GenerationBatch:
         if not self.uids:
             return []
 
-        tokens, logprobs = self._step()
+        tokens, logprobs, token_logprobs = self._step()
 
         keep = []
         responses = []
@@ -1473,6 +1501,7 @@ class GenerationBatch:
                         finish_reason=finish_reason,
                         prompt_cache=self.extract_cache(i),
                         all_tokens=self.tokens[i],
+                        logprob=token_logprobs[i],
                     )
                 )
             else:
@@ -1485,6 +1514,7 @@ class GenerationBatch:
                         finish_reason=None,
                         prompt_cache=None,
                         all_tokens=None,
+                        logprob=token_logprobs[i],
                     )
                 )
 
@@ -1984,7 +2014,7 @@ def batch_generate(
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
                     if return_logprobs:
-                        logprob_results[r.uid].append(r.logprobs[r.token].item())
+                        logprob_results[r.uid].append(r.logprob)
     gen.close()
     if verbose:
         print(f"[batch_generate] Finished processing {fin}/{num_samples}")
