@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import moe_router
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .switch_layers import SwitchGLU, compiled_decode
@@ -126,13 +127,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         x: mx.array,
     ) -> mx.array:
         gates = self.gate(x)
-        gates = mx.softmax(gates, axis=-1, precise=True)
-
         k = self.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        if self.norm_topk_prob:
-            scores /= mx.sum(scores, axis=-1, keepdims=True)
+        if moe_router.enabled():
+            # One kernel for softmax + top-k + normalization (bit-identical
+            # to the chain below, see moe_router).
+            inds, scores = moe_router.softmax_topk(gates, k, self.norm_topk_prob)
+        else:
+            gates = mx.softmax(gates, axis=-1, precise=True)
+            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            scores = mx.take_along_axis(gates, inds, axis=-1)
+            if self.norm_topk_prob:
+                scores /= mx.sum(scores, axis=-1, keepdims=True)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)

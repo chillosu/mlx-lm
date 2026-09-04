@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import moe_router
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
@@ -181,7 +182,14 @@ class MoEGate(nn.Module):
         raise ValueError(f"Unknown moe_router_score_func: {self.score_func!r}")
 
     def __call__(self, x):
-        logits = (x @ self.weight.T).astype(mx.float32)
+        logits = x @ self.weight.T
+        if moe_router.enabled() and self.score_func == "sigmoid":
+            # One kernel for sigmoid + bias + top-k + normalization
+            # (bit-identical to the chain below, see moe_router).
+            return moe_router.sigmoid_topk(
+                logits, self.e_score_correction_bias, self.top_k, self.softcap
+            )
+        logits = logits.astype(mx.float32)
         if self.softcap > 0.0:
             logits = mx.tanh(logits / self.softcap) * self.softcap
 
@@ -208,7 +216,11 @@ class MoE(nn.Module):
         self.shared_expert = MLP(args.hidden_size, args.shared_expert_intermediate_size)
 
     def __call__(self, x):
-        # The router stays eager: compiled, its sigmoid fuses with the
+        if moe_router.enabled() and self.gate.score_func == "sigmoid":
+            # Router = matmul + one custom kernel: nothing for compile to
+            # fuse, so the whole block can be a compiled decode graph.
+            return self._fused(x)
+        # The eager router stays eager: compiled, its sigmoid fuses with the
         # neighbouring elementwise ops into a JIT kernel that differs from the
         # standalone sigmoid by 1 ulp, and top-k turns that into different
         # expert choices (greedy text diverged). The expert mixing below is
@@ -216,13 +228,19 @@ class MoE(nn.Module):
         inds, weights = self.gate(x)
         return self._mix(x, inds, weights)
 
-    @compiled_decode
-    def _mix(self, x, inds, weights):
+    def _mix_impl(self, x, inds, weights):
         shared_out = self.shared_expert(x)
         y = self.switch_mlp(x, inds)
         y = (y * weights[..., None]).sum(axis=-2).astype(x.dtype)
 
         return y * self.routed_scaling_factor + shared_out
+
+    _mix = compiled_decode(_mix_impl)
+
+    @compiled_decode
+    def _fused(self, x):
+        inds, weights = self.gate(x)
+        return self._mix_impl(x, inds, weights)
 
 
 class TransformerBlock(nn.Module):
