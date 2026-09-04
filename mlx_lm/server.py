@@ -180,7 +180,20 @@ def _cache_store_listing(prompt_cache, rank):
 _CACHE_LOOKUP_DEBUG = os.environ.get("MLX_LM_CACHE_LOOKUP_DEBUG", "1") != "0"
 
 
-def _log_cache_lookup(prompt_cache, model_key, prompt, matched):
+def _describe_divergence(tokenizer, stored, prompt, at, n=40):
+    """TEMP DEBUG: decode the tokens around a prefix divergence on both sides."""
+    if tokenizer is None:
+        return []
+    lo, hi = max(0, at - n), at + n
+    return [
+        f"    divergence@{at} stored: "
+        f"{tokenizer.decode(stored[lo:at])!r} | {tokenizer.decode(stored[at:hi])!r}",
+        f"    divergence@{at} prompt: "
+        f"{tokenizer.decode(prompt[lo:at])!r} | {tokenizer.decode(prompt[at:hi])!r}",
+    ]
+
+
+def _log_cache_lookup(prompt_cache, model_key, prompt, matched, tokenizer=None):
     """CACHE-LOOKUP-V4: explain why a prompt-cache lookup did or did not hit.
 
     K3's cache is not trimmable (ArraysCache.is_trimmable() is False), so
@@ -195,16 +208,42 @@ def _log_cache_lookup(prompt_cache, model_key, prompt, matched):
     try:
         n_entries = len(prompt_cache)
         if matched:
+            # Which entry served it: an entry that is a full prefix of the
+            # prompt, or a longer entry trimmed back to the common prefix.
+            via = ""
+            best = None
+            for cache_type in prompt_cache._lru._ordering:
+                for model, tokens in list(prompt_cache._lru._lrus[cache_type]):
+                    if model != model_key:
+                        continue
+                    common = 0
+                    for a, b in zip(tokens, prompt):
+                        if a != b:
+                            break
+                        common += 1
+                    if best is None or common > best[0]:
+                        best = (common, tokens, cache_type)
+            if best is not None:
+                common, tokens, cache_type = best
+                kind = "full_prefix" if common == len(tokens) else "trimmed"
+                via = (
+                    f" via={kind} entry type={cache_type} len={len(tokens)} "
+                    f"common_prefix={common}"
+                )
             logging.info(
                 f"cache lookup: HIT prompt={len(prompt)} cached={matched} "
-                f"entries={n_entries}"
+                f"entries={n_entries}{via}"
             )
+            if best is not None and kind == "trimmed":
+                for line in _describe_divergence(tokenizer, tokens, prompt, common):
+                    logging.info(line)
             return
         in_trie = model_key in prompt_cache._trie._trie
         logging.info(
             f"cache lookup: MISS prompt={len(prompt)} entries={n_entries} "
             f"model_key_in_trie={in_trie} model_key={model_key!r}"
         )
+        best = None
         for cache_type in prompt_cache._lru._ordering:
             for model, tokens in list(prompt_cache._lru._lrus[cache_type]):
                 if model != model_key:
@@ -224,6 +263,11 @@ def _log_cache_lookup(prompt_cache, model_key, prompt, matched):
                     f"  entry type={cache_type} len={len(tokens)} "
                     f"common_prefix={common} is_full_prefix={full}{note}"
                 )
+                if not full and common > 0 and (best is None or common > best[0]):
+                    best = (common, tokens)
+        if best is not None:
+            for line in _describe_divergence(tokenizer, best[1], prompt, best[0]):
+                logging.info(line)
     except Exception as e:
         logging.warning(f"cache lookup diagnostic failed: {e!r}")
 
@@ -1076,6 +1120,7 @@ class ResponseGenerator:
                         current_model_key,
                         prompt,
                         prompt_cache_count,
+                        tokenizer=current_tokenizer,
                     )
                     N = prompt_cache_count
                     while N > 0:
@@ -1440,6 +1485,7 @@ class ResponseGenerator:
                 self.model_provider.model_key,
                 prompt,
                 ctx.prompt_cache_count,
+                tokenizer=tokenizer,
             )
             cache_key = prompt[:]
             if cache is None:

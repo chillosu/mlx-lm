@@ -23,7 +23,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, PoolingCache, RotatingKVCache
+from .cache import CacheList, PoolingCache, SlidingWindowKVCache
 from .mla import MultiLinear
 from .switch_layers import SwitchGLU
 
@@ -1494,11 +1494,11 @@ class Model(nn.Module):
         for layer in self.layers:
             ratio = layer.attn.compress_ratio
             if ratio == 0:
-                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
+                caches.append(SlidingWindowKVCache(self.args.sliding_window))
             elif isinstance(layer.attn, SparseCompressedAttention):
                 caches.append(
                     CacheList(
-                        RotatingKVCache(max_size=self.args.sliding_window),
+                        SlidingWindowKVCache(self.args.sliding_window),
                         PoolingCache(ratio),
                         PoolingCache(ratio),
                     )
@@ -1506,7 +1506,7 @@ class Model(nn.Module):
             else:
                 caches.append(
                     CacheList(
-                        RotatingKVCache(max_size=self.args.sliding_window),
+                        SlidingWindowKVCache(self.args.sliding_window),
                         PoolingCache(ratio),
                     )
                 )

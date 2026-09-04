@@ -108,7 +108,25 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     """
     if not can_trim_prompt_cache(cache) or len(cache) == 0:
         return 0
+    num_tokens = _align_trim(cache, num_tokens)
     return [c.trim(num_tokens) for c in cache][0]
+
+
+def _align_trim(caches, n: int) -> int:
+    """Amount every cache in ``caches`` can cut so they stay on one position.
+
+    Caches that can only cut at their own boundaries (e.g. ``PoolingCache``)
+    expose ``align_trim(n)`` returning what ``trim(n)`` would really remove;
+    iterate to a fixed point so a ratio-4 and a ratio-128 layer agree.
+    """
+    while True:
+        m = n
+        for c in caches:
+            if c is not None and hasattr(c, "align_trim"):
+                m = c.align_trim(m)
+        if m == n:
+            return n
+        n = m
 
 
 def create_attention_mask(
@@ -591,6 +609,54 @@ class RotatingKVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+class SlidingWindowKVCache(KVCache):
+    """KV cache for a fixed sliding-window attention that keeps the full history.
+
+    Attention only ever sees the last ``max_size`` positions (plus the new
+    tokens), exactly like :class:`RotatingKVCache`, but nothing is evicted so
+    the cache can be trimmed back to any earlier position (a prompt-cache entry
+    can be cut to the common prefix of a diverging prompt). Costs ``offset``
+    entries of memory instead of ``max_size``; attention cost is unchanged
+    since ``update_and_fetch`` returns at most ``max_size + S - 1`` positions.
+    """
+
+    def __init__(self, max_size):
+        super().__init__()
+        self.max_size = max_size
+
+    def update_and_fetch(self, keys, values):
+        prev = self.offset
+        keys, values = super().update_and_fetch(keys, values)
+        start = max(0, prev - (self.max_size - 1))
+        return keys[..., start:, :], values[..., start:, :]
+
+    @property
+    def meta_state(self):
+        return str(self.max_size)
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.max_size = int(v)
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4):
+        raise NotImplementedError("SlidingWindowKVCache Quantization NYI")
+
+    def make_mask(
+        self, N: int, window_size: Optional[int] = None, return_array: bool = False
+    ):
+        # The served keys are the last min(offset, max_size - 1) positions
+        # followed by the N new ones: the same mask RotatingKVCache produces.
+        if N == 1:
+            return None
+        window_size = window_size or self.max_size
+        offset = min(self.max_size - 1, self.offset)
+        return create_causal_mask(N, offset, window_size=window_size)
+
+    @classmethod
+    def merge(_, caches):
+        return BatchSlidingWindowKVCache.merge(caches)
+
+
 class ArraysCache(_BaseCache):
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
@@ -830,7 +896,11 @@ class CacheList(_BaseCache):
     def is_trimmable(self):
         return all(c.is_trimmable() for c in self.caches)
 
+    def align_trim(self, n):
+        return _align_trim(self.caches, n)
+
     def trim(self, n):
+        n = self.align_trim(n)
         for c in self.caches:
             m = c.trim(n)
         return m
@@ -1137,6 +1207,85 @@ class BatchKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+class BatchSlidingWindowKVCache(BatchKVCache):
+    """Batched (left-padded) counterpart of :class:`SlidingWindowKVCache`."""
+
+    def __init__(self, max_size, left_padding: List[int]):
+        super().__init__(left_padding)
+        self.max_size = max_size
+
+    def update_and_fetch(self, keys, values):
+        prev = self._idx
+        keys, values = super().update_and_fetch(keys, values)
+        start = max(0, prev - (self.max_size - 1))
+        return keys[..., start:, :], values[..., start:, :]
+
+    @property
+    def meta_state(self):
+        return str(self.max_size)
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.max_size = int(v)
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4):
+        raise NotImplementedError("BatchSlidingWindowKVCache Quantization NYI")
+
+    def make_mask(
+        self, N: int, window_size: Optional[int] = None, return_array: bool = False
+    ):
+        window_size = window_size or self.max_size
+        mask = create_causal_mask(
+            N,
+            offset=self._idx,
+            window_size=window_size,
+            left_padding=self.left_padding,
+        )
+        start = max(0, self._idx - (self.max_size - 1))
+        return mask[..., start:]
+
+    def extract(self, idx):
+        cache = SlidingWindowKVCache(self.max_size)
+        padding = self.left_padding[idx].item()
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
+        cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
+        cache.offset = cache.keys.shape[2]
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        max_size = caches[0].max_size
+        lengths = [c.size() for c in caches]
+        max_length = max(lengths)
+
+        # No cache has content so make an empty one
+        if max_length == 0:
+            return cls(max_size, [0] * len(caches))
+
+        padding = [max_length - l for l in lengths]
+        B = len(caches)
+        H = max(c.keys.shape[1] for c in caches if c.keys is not None)
+        Dk = max(c.keys.shape[3] for c in caches if c.keys is not None)
+        Dv = max(c.values.shape[3] for c in caches if c.values is not None)
+        dt = next(iter(c.keys.dtype for c in caches if c.keys is not None))
+
+        keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
+        values = mx.zeros((B, H, max_length, Dv), dtype=dt)
+        for i, (p, c) in enumerate(zip(padding, caches)):
+            if c.keys is None:
+                continue
+            keys[i : i + 1, :, p : p + c.offset] = c.keys[..., : c.offset, :]
+            values[i : i + 1, :, p : p + c.offset] = c.values[..., : c.offset, :]
+
+        cache = cls(max_size, padding)
+        cache.keys = keys
+        cache.values = values
+        cache.offset += keys.shape[2]
+        cache._idx = keys.shape[2]
+
+        return cache
 
 
 class BatchRotatingKVCache(_BaseCache):
@@ -1621,26 +1770,46 @@ class PoolingCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return self.ratio
+        return str(self.ratio)
 
     @meta_state.setter
     def meta_state(self, v):
-        self.ratio = v
+        self.ratio = int(v)
 
     @classmethod
     def from_state(cls, state, meta_state):
         # Restoring buffered state calls ``accumulate_windows``, which needs
         # the compression ratio before the generic state setter can run.
-        obj = cls(meta_state)
+        obj = cls(int(meta_state))
         obj.state = state
         return obj
 
     def is_trimmable(self):
-        return self.pooled is None
+        return True
+
+    def align_trim(self, n):
+        """Tokens ``trim(n)`` would actually remove.
+
+        The sub-window remainder can be cut exactly; anything deeper lands on
+        the previous window boundary because the raw tokens of a pooled window
+        are gone (only the pooled entry is kept). ``trim_prompt_cache`` uses
+        this to cut every layer of a model at the same position.
+        """
+        if n <= self.remainder:
+            return n
+        total = self.size() * self.ratio + self.remainder
+        n = min(n, total)
+        keep = ((total - n) // self.ratio) * self.ratio
+        return total - keep
 
     def trim(self, n):
-        n = min(self.remainder, n)
-        self.remainder -= n
+        n = self.align_trim(n)
+        if n <= self.remainder:
+            self.remainder -= n
+            return n
+        keep = (self.size() * self.ratio + self.remainder - n) // self.ratio
+        self.remainder = 0
+        self.pooled = self.pooled[:, :keep] if keep > 0 else None
         return n
 
     def size(self):
@@ -2303,8 +2472,12 @@ class LRUPromptCache:
                 cache = copy.deepcopy(cache_entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
-                trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
+                # Some caches only cut at a boundary and may remove more than
+                # asked; the reusable prefix is whatever is actually left.
+                prefix = len(result.longer) - trim_prompt_cache(cache, num_to_trim)
+                if prefix > short_length:
+                    return cache, tokens[prefix:]
+                del cache
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
