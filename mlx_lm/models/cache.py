@@ -1755,18 +1755,24 @@ class PoolingCache(_BaseCache):
 
     @property
     def state(self):
-        buf_kv = self.buf_kv[:, : self.remainder] if self.remainder > 0 else None
-        buf_gate = self.buf_gate[:, : self.remainder] if self.remainder > 0 else None
-        return (buf_kv, buf_gate, self.pooled)
+        # Empty pieces are zero-size arrays rather than None so the state can
+        # be flattened into a safetensors file (the server's cache store).
+        if self.remainder > 0:
+            buf_kv = self.buf_kv[:, : self.remainder]
+            buf_gate = self.buf_gate[:, : self.remainder]
+        else:
+            buf_kv = buf_gate = mx.zeros((0, 0, 0))
+        pooled = self.pooled if self.pooled is not None else mx.zeros((0, 0, 0))
+        return (buf_kv, buf_gate, pooled)
 
     @state.setter
     def state(self, v):
         buf_kv, buf_gate, pooled = v
         self.remainder = 0
         self.buf_kv = self.buf_gate = None
-        if buf_kv is not None:
+        if buf_kv is not None and buf_kv.size > 0:
             self.accumulate_windows(buf_kv, buf_gate, 0)
-        self.pooled = pooled
+        self.pooled = pooled if pooled is not None and pooled.size > 0 else None
 
     @property
     def meta_state(self):
