@@ -669,6 +669,12 @@ class ModelProvider:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
 
+        tool_parser = tokenizer.tool_parser
+        logging.info(
+            "Tool parser: "
+            + (tool_parser.__module__.rsplit(".", 1)[-1] if tool_parser else "none")
+        )
+
         # Load the draft model for speculative decoding
         draft_model = None
         if draft_model_path is not None:
