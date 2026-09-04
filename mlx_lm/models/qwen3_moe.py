@@ -10,7 +10,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .pipeline import PipelineMixin
-from .switch_layers import SwitchGLU
+from .switch_layers import SwitchGLU, compiled_decode
 
 
 @dataclass
@@ -124,6 +124,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         self.sharding_group = None
 
+    @compiled_decode
     def __call__(
         self,
         x: mx.array,
