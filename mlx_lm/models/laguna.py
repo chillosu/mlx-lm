@@ -8,7 +8,7 @@ from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
-from .switch_layers import SwitchGLU
+from .switch_layers import SwitchGLU, compiled_decode
 
 
 @dataclass
@@ -208,9 +208,17 @@ class MoE(nn.Module):
         self.shared_expert = MLP(args.hidden_size, args.shared_expert_intermediate_size)
 
     def __call__(self, x):
-        shared_out = self.shared_expert(x)
-
+        # The router stays eager: compiled, its sigmoid fuses with the
+        # neighbouring elementwise ops into a JIT kernel that differs from the
+        # standalone sigmoid by 1 ulp, and top-k turns that into different
+        # expert choices (greedy text diverged). The expert mixing below is
+        # bit-identical under compile.
         inds, weights = self.gate(x)
+        return self._mix(x, inds, weights)
+
+    @compiled_decode
+    def _mix(self, x, inds, weights):
+        shared_out = self.shared_expert(x)
         y = self.switch_mlp(x, inds)
         y = (y * weights[..., None]).sum(axis=-2).astype(x.dtype)
 

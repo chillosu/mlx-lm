@@ -8,7 +8,7 @@ import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .switch_layers import SwitchGLU
+from .switch_layers import SwitchGLU, compiled_decode
 
 
 @dataclass
@@ -120,6 +120,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
 
+    @compiled_decode
     def __call__(
         self,
         x: mx.array,

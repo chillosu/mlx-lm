@@ -10,8 +10,49 @@ import mlx.nn as nn
 from .activations import swiglu
 
 
-# Kill switch for the lazy up/gate fusion in SwitchGLU (set to 0 to disable).
+# Kill switches (set to 0 to disable): lazy up/gate fusion in SwitchGLU, and
+# the compiled decode path of MoE blocks decorated with ``compiled_decode``.
 _FUSE_UP_GATE = os.environ.get("MLX_LM_FUSE_MOE_UP_GATE", "1") != "0"
+_COMPILE_DECODE = os.environ.get("MLX_LM_COMPILE_MOE_DECODE", "1") != "0"
+
+
+def compiled_decode(forward):
+    """Decorator for an MoE block method ``forward(self, x, *args)``.
+
+    At decode shapes (``x`` of sequence length 1, eval mode) the method runs
+    as one shape-specialized ``mx.compile``d graph, traced once per batch
+    size; any other shape (prefill, training) runs the plain Python method.
+    At these shapes the block is dominated by per-kernel fixed cost, so
+    replaying a pre-built graph from C++ (no op-by-op Python graph
+    construction) is measurably faster. The block's parameters are compile
+    *inputs*, not closure constants, so later weight updates are honored.
+
+    Only decorate graphs that stay bit-identical under compile: adjacent
+    elementwise ops get fused into JIT kernels whose transcendental math can
+    differ from the standalone kernels by an ulp (``mx.sigmoid`` does), and a
+    discrete top-k router turns an ulp into a different expert choice. Keep
+    such routers eager and decorate the expert-mixing part instead.
+    """
+    key = "_compiled_" + forward.__name__
+
+    @wraps(forward)
+    def wrapper(self, x, *args):
+        if self.training or x.shape[1] != 1 or not _COMPILE_DECODE:
+            return forward(self, x, *args)
+        fn = self.__dict__.get(key)
+        if fn is None:
+            # Finalize the module structure before tracing (the fused weights
+            # must exist and be materialized outside the trace).
+            if _FUSE_UP_GATE:
+                for m in self.modules():
+                    if isinstance(m, SwitchGLU):
+                        m.fuse_up_gate()
+            mx.eval(self.parameters())
+            fn = mx.compile(partial(forward, self), inputs=[self])
+            setattr(self, key, fn)
+        return fn(x, *args)
+
+    return wrapper
 
 
 def _gather_sort(x, indices):
