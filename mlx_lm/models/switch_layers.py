@@ -1,12 +1,17 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import math
-from functools import partial
+import os
+from functools import partial, wraps
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .activations import swiglu
+
+
+# Kill switch for the lazy up/gate fusion in SwitchGLU (set to 0 to disable).
+_FUSE_UP_GATE = os.environ.get("MLX_LM_FUSE_MOE_UP_GATE", "1") != "0"
 
 
 def _gather_sort(x, indices):
@@ -59,6 +64,20 @@ class QuantizedSwitchLinear(nn.Module):
 
         # Freeze this model's parameters
         self.freeze()
+
+    @classmethod
+    def from_arrays(cls, weight, scales, biases, bias, group_size, bits, mode):
+        """Build a layer around already-quantized arrays without running the
+        (expensive) random init + quantize of ``__init__``."""
+        ql = cls.__new__(cls)
+        nn.Module.__init__(ql)
+        ql.weight, ql.scales = weight, scales
+        ql.biases = biases
+        if bias is not None:
+            ql.bias = bias
+        ql.group_size, ql.bits, ql.mode = group_size, bits, mode
+        ql.freeze()
+        return ql
 
     @property
     def input_dims(self):
@@ -173,7 +192,50 @@ class SwitchGLU(nn.Module):
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
+    def fuse_up_gate(self):
+        """Concatenate ``up_proj`` and ``gate_proj`` along the output dim into
+        one ``up_gate_proj`` so a forward pass runs one gather-matmul instead
+        of two (same bytes read, one kernel launch fewer; bit-identical
+        output). Idempotent. A no-op when the two projections are not plain
+        (Quantized)SwitchLinear of the same type (e.g. wrapped in LoRA)."""
+        if "up_gate_proj" in self or "up_proj" not in self:
+            return
+        up, gate = self.up_proj, self.gate_proj
+        if type(up) is not type(gate) or type(up) not in (
+            SwitchLinear,
+            QuantizedSwitchLinear,
+        ):
+            return
+        bias = (
+            mx.concatenate([up.bias, gate.bias], axis=-1) if "bias" in up else None
+        )
+        if isinstance(up, QuantizedSwitchLinear):
+            fused = QuantizedSwitchLinear.from_arrays(
+                mx.concatenate([up.weight, gate.weight], axis=1),
+                mx.concatenate([up.scales, gate.scales], axis=1),
+                (
+                    mx.concatenate([up.biases, gate.biases], axis=1)
+                    if up.get("biases") is not None
+                    else None
+                ),
+                bias,
+                up.group_size,
+                up.bits,
+                up.mode,
+            )
+        else:
+            fused = SwitchLinear.__new__(SwitchLinear)
+            nn.Module.__init__(fused)
+            fused.weight = mx.concatenate([up.weight, gate.weight], axis=1)
+            if bias is not None:
+                fused.bias = bias
+        self.up_gate_proj = fused
+        del self.up_proj
+        del self.gate_proj
+
     def __call__(self, x, indices) -> mx.array:
+        if _FUSE_UP_GATE and not self.training and "up_gate_proj" not in self:
+            self.fuse_up_gate()
         x = mx.expand_dims(x, (-2, -3))
 
         # When we have many tokens, then sort them to make sure that the access
@@ -185,8 +247,13 @@ class SwitchGLU(nn.Module):
             x, idx, inv_order = _gather_sort(x, indices)
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        if "up_gate_proj" in self:
+            x_up, x_gate = mx.split(
+                self.up_gate_proj(x, idx, sorted_indices=do_sort), 2, axis=-1
+            )
+        else:
+            x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+            x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
         x = self.down_proj(
             self.activation(x_up, x_gate),
             idx,
