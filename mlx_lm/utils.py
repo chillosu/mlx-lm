@@ -458,11 +458,76 @@ def load_model(
 
     model.eval()
     model.load_weights(list(weights.items()), strict=strict)
+    _align_quant_param_dtypes(model, config)
 
     if not lazy:
         mx.eval(model.parameters())
 
     return model, config
+
+
+def _align_quant_param_dtypes(model: nn.Module, config: dict):
+    """Give quantized ``scales``/``biases`` a dtype that matches the activations.
+
+    ``quantized_matmul``/``gather_qmm`` promote mismatched inputs to a common
+    dtype by casting them -- including the *whole* scales and biases tables --
+    on every call. A checkpoint that stores float16 scales next to bfloat16
+    norms (GLM-5.3-4bit does) therefore runs every quantized matmul in
+    float32 and, for a 256-expert MoE, re-casts the entire expert table per
+    token: measured 2026-09-04 on the GLM-5.3 TP4 cluster as 0.47 ms per
+    ``gather_qmm`` vs 0.05 ms once aligned (57 vs 560 GB/s), 56 ms of a
+    150 ms decode step. Aligning once at load costs nothing per token.
+
+    ``MLX_LM_QUANT_PARAM_DTYPE`` selects the target:
+
+    * ``promoted`` (default): cast to float32, the dtype the mismatch already
+      promotes to -- bit-identical outputs, +2 bytes per quantization group.
+    * ``model``: cast to the model dtype -- no promotion anywhere (activations
+      stay in the model dtype), but fp16->bf16 drops 3 mantissa bits of scale.
+    * ``keep``: leave the checkpoint dtypes alone.
+
+    A no-op when the checkpoint is already consistent.
+    """
+    mode = os.environ.get("MLX_LM_QUANT_PARAM_DTYPE", "promoted")
+    if mode == "keep":
+        return
+    if mode not in ("promoted", "model"):
+        raise ValueError(f"MLX_LM_QUANT_PARAM_DTYPE={mode!r}: use promoted, model or keep")
+    params = [
+        (k, v)
+        for k, v in tree_flatten(model.parameters())
+        if isinstance(v, mx.array) and mx.issubdtype(v.dtype, mx.floating)
+    ]
+    is_quant = lambda k: k.endswith((".scales", ".biases"))
+    quant = [(k, v) for k, v in params if is_quant(k)]
+    if not quant:
+        return
+    # Activation dtype: what the non-quantized floating parameters use, if
+    # they agree (ignoring float32 leaves such as router bias terms);
+    # otherwise the config's declared dtype.
+    others = {v.dtype for k, v in params if not is_quant(k) and v.dtype != mx.float32}
+    if len(others) == 1:
+        act_dtype = next(iter(others))
+    elif (name := config.get("dtype") or config.get("torch_dtype")) and hasattr(mx, name):
+        act_dtype = getattr(mx, name)
+    else:
+        return
+    mismatched = [(k, v) for k, v in quant if v.dtype != act_dtype]
+    if not mismatched:
+        return
+    target = mx.float32 if mode == "promoted" else act_dtype
+    casts = [(k, v.astype(target)) for k, v in mismatched]
+    if mode == "promoted":
+        # Downstream of the first quantized layer the activations are now
+        # float32, so a plain ``nn.Linear`` kept in the model dtype (e.g. an
+        # untied lm_head: 1.9 GB for GLM-5.3, 13.6 ms of a 99 ms step) gets
+        # cast by ``matmul`` on every call too. Same cast, done once.
+        for path, m in model.named_modules():
+            if type(m) is nn.Linear and m.weight.dtype != mx.float32:
+                for name in ("weight", "bias"):
+                    if name in m:
+                        casts.append((f"{path}.{name}", m[name].astype(mx.float32)))
+    model.update(tree_unflatten(casts))
 
 
 def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
